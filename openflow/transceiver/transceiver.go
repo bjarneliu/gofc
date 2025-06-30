@@ -64,6 +64,7 @@ type Transceiver struct {
 	factory     openflow.Factory
 	pingCounter uint
 	closed      bool
+	negotiated  bool
 }
 
 type Handler interface {
@@ -138,10 +139,25 @@ func (r *Transceiver) sendEchoRequest() error {
 	return nil
 }
 
+func (r *Transceiver) sendHello() error {
+
+	msg, err := r.factory.NewHello()
+	if err != nil {
+		return err
+	}
+
+	if err := r.Write(msg); err != nil {
+		return errors.Wrap(err, "failed to send Hello message")
+	}
+
+	return nil
+}
+
 func (r *Transceiver) Run(ctx context.Context) error {
 	defer logger.Info("transceiver is closed")
 	r.stream.SetReadTimeout(readTimeout)
 	r.stream.SetWriteTimeout(writeTimeout)
+	r.negotiated = false
 
 	readerCtx, cancelReader := context.WithCancel(ctx)
 	defer cancelReader()
@@ -184,6 +200,7 @@ func (r *Transceiver) Run(ctx context.Context) error {
 }
 
 func (r *Transceiver) negotiate(ctx context.Context, reader <-chan []byte) (packet []byte, err error) {
+
 	select {
 	case <-ctx.Done():
 		return nil, errors.New("context done")
@@ -193,6 +210,7 @@ func (r *Transceiver) negotiate(ctx context.Context, reader <-chan []byte) (pack
 		if !ok {
 			return nil, errors.New("the reader channel is closed")
 		}
+
 		// The first message should be HELLO.
 		if packet[1] != 0x00 {
 			return nil, errors.New("missing HELLO message")
@@ -203,11 +221,23 @@ func (r *Transceiver) negotiate(ctx context.Context, reader <-chan []byte) (pack
 			r.version = openflow.OF10_VERSION
 			r.factory = of10.NewFactory()
 			logger.Info("negotiated to openflow version 1.0")
+			// change packet to 1.0 and dispatch it
+			packet[0] = openflow.OF10_VERSION
 		} else {
 			r.version = openflow.OF13_VERSION
 			r.factory = of13.NewFactory()
 			logger.Info("negotiated to openflow version 1.3")
+			// change packet to 1.3 and dispatch it
+			packet[0] = openflow.OF13_VERSION
 		}
+
+		if err := r.sendHello(); err != nil {
+			return nil, fmt.Errorf("failed to send hello request: %w", err)
+		}
+		logger.Infof("sendHello 0x%x success", packet[0])
+
+		// negotiation succeeds
+		r.negotiated = true
 
 		// Return the initial packet to dispatch it.
 		return packet, nil
@@ -250,15 +280,20 @@ func (r *Transceiver) runReader(ctx context.Context) <-chan []byte {
 			// Update the timestamp
 			lastActivated = time.Now()
 
-			ok, err := r.handleEcho(packet)
-			if err != nil {
-				logger.Errorf("failed to handle the echo request or response: %v", err)
-				return
-			}
-			if ok {
-				// Do not forward the echo request and response
-				// packets because this reader handles them.
-				continue
+			// logger.Infof("packet=%v", packet)
+
+			if r.negotiated {
+				// Handle the echo request or response
+				ok, err := r.handleEcho(packet)
+				if err != nil {
+					logger.Errorf("failed to handle the echo request or response: %v", err)
+					return
+				}
+				if ok {
+					// Do not forward the echo request and response
+					// packets because this reader handles them.
+					continue
+				}
 			}
 
 			// Forward messages except the echo request and response.
